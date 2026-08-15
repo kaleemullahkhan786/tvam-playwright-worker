@@ -6,11 +6,12 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV TVAM_HEADLESS=true
-# Browsers already in this image
+# Must match playwright package version (browsers preinstalled in this image)
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 COPY package.json ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev --no-package-lock
 
 COPY . .
 

@@ -1,0 +1,8 @@
+node_modules
+storage/storageState.json
+storage/screenshots
+storage/dead-letter
+.env
+.git
+*.md
+npm-debug.log

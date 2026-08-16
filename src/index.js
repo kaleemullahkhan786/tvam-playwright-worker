@@ -164,6 +164,15 @@ async function processJob(context, job) {
     const scripts = job.scripts || [];
     if (!scripts.length) {
       await onStep('Job has no scripts to process (empty script list).', 'error');
+      await safePostResult({
+        job_id: job.id,
+        status: 'failed',
+        message: 'Job has no scripts to process. Re-queue Grant with scripts selected.',
+        error: 'SCRIPT_NOT_FOUND',
+        error_code: ErrorCodes.SCRIPT_NOT_FOUND,
+        retry: false,
+        results: [],
+      });
       return {
         allOk: false,
         sessionExpired: false,

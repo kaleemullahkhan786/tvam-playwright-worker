@@ -163,12 +163,13 @@ async function processJob(context, job) {
   try {
     const scripts = job.scripts || [];
     if (!scripts.length) {
-      await onStep('No pending scripts left on this job.');
+      await onStep('Job has no scripts to process (empty script list).', 'error');
       return {
-        allOk: true,
+        allOk: false,
         sessionExpired: false,
         results: [],
-        message: 'No pending scripts left on this job.',
+        message: 'Job has no scripts to process. Re-queue Grant with scripts selected.',
+        error_code: ErrorCodes.SCRIPT_NOT_FOUND,
       };
     }
 
@@ -240,6 +241,27 @@ async function processJob(context, job) {
               message: err.message,
             });
             await onStep(`SESSION_EXPIRED: ${err.message}`, 'error');
+            break;
+          }
+
+          // Non-transient: retrying will not help.
+          const noRetry = [
+            ErrorCodes.USERNAME_NOT_FOUND,
+            ErrorCodes.SCRIPT_NOT_FOUND,
+            ErrorCodes.ALREADY_GRANTED,
+            ErrorCodes.ALREADY_REVOKED,
+          ];
+          if (noRetry.includes(code)) {
+            results.push({
+              script_id: script.id,
+              success: false,
+              status: 'failed',
+              error_code: code,
+              message: err.message,
+              error: err.message,
+            });
+            await onStep(`Script "${script.script_name}" failed: ${err.message}`, 'error');
+            lastError = null;
             break;
           }
 

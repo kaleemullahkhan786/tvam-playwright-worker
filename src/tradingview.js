@@ -105,6 +105,13 @@ async function openManageAccess(page) {
     return dialog;
   }
 
+  // Cookie / consent banners can block the Manage Access control.
+  const consent = page.getByRole('button', { name: /accept all|i agree|allow all|got it|ok/i }).first();
+  if (await consent.isVisible().catch(() => false)) {
+    await consent.click({ timeout: 5000 }).catch(() => {});
+    await sleep(400);
+  }
+
   await clickFirstVisible(
     page,
     [
@@ -112,6 +119,8 @@ async function openManageAccess(page) {
       page.getByRole('link', { name: /^manage access$/i }),
       page.getByRole('button', { name: /manage access/i }),
       page.getByRole('link', { name: /manage access/i }),
+      page.getByText(/^manage access$/i),
+      page.locator('a, button').filter({ hasText: /^manage access$/i }),
     ],
     'manage-access'
   );
@@ -171,41 +180,64 @@ async function waitForSearchSettled(dialog, timeoutMs = 12000) {
  * @param {string} username
  * @returns {Promise<'exists'|'not_found'|'loading_timeout'|'unknown'>}
  */
-async function resolveUsernameSearch(dialog, username) {
-  const settle = await waitForSearchSettled(dialog);
-  if (settle === 'loading_timeout') {
-    return 'loading_timeout';
-  }
-
-  const noResults = dialog
-    .getByText(/no results|not found|couldn.?t find|no users found|nothing found|user does not exist/i)
-    .first();
-  if (await noResults.isVisible().catch(() => false)) {
-    return 'not_found';
-  }
-
-  const networkHint = dialog.getByText(/network|offline|connection|try again|something went wrong/i).first();
-  if (await networkHint.isVisible().catch(() => false)) {
-    throw new AutomationError(ErrorCodes.NETWORK_ERROR, 'TradingView search reported a network/connection problem.');
-  }
-
-  // Prefer selectable suggestion / option / listitem matching exact username.
+async function usernameSuggestionVisible(dialog, username) {
   const candidates = [
     dialog.getByRole('option', { name: username, exact: true }),
     dialog.getByRole('listitem').filter({ hasText: new RegExp(`^\\s*${escapeRegExp(username)}\\s*$`, 'i') }),
-    dialog.locator('[role="option"], [role="listbox"] *').filter({ hasText: new RegExp(`^\\s*${escapeRegExp(username)}\\s*$`, 'i') }),
+    dialog.locator('[role="option"], [role="listbox"] *').filter({
+      hasText: new RegExp(`^\\s*${escapeRegExp(username)}\\s*$`, 'i'),
+    }),
     dialog.getByText(username, { exact: true }),
   ];
 
   for (const locator of candidates) {
     const first = locator.first();
     if (await first.isVisible().catch(() => false)) {
-      return 'exists';
+      return true;
     }
   }
+  return false;
+}
 
-  // Empty suggestion area with no explicit "no results" — treat as not found after settle.
-  return 'not_found';
+async function resolveUsernameSearch(dialog, username) {
+  const deadline = Date.now() + 15000;
+  let sawExplicitNoResults = false;
+
+  while (Date.now() < deadline) {
+    await waitForSearchSettled(dialog, 4000);
+
+    const networkHint = dialog
+      .getByText(/network|offline|connection|try again|something went wrong/i)
+      .first();
+    if (await networkHint.isVisible().catch(() => false)) {
+      throw new AutomationError(
+        ErrorCodes.NETWORK_ERROR,
+        'TradingView search reported a network/connection problem.'
+      );
+    }
+
+    if (await usernameSuggestionVisible(dialog, username)) {
+      return 'exists';
+    }
+
+    const noResults = dialog
+      .getByText(/no results|not found|couldn.?t find|no users found|nothing found|user does not exist/i)
+      .first();
+    if (await noResults.isVisible().catch(() => false)) {
+      sawExplicitNoResults = true;
+      // Keep polling briefly — TV sometimes flashes empty state before results.
+      await sleep(500);
+      continue;
+    }
+
+    await sleep(400);
+  }
+
+  if (await usernameSuggestionVisible(dialog, username)) {
+    return 'exists';
+  }
+
+  return sawExplicitNoResults ? 'not_found' : 'loading_timeout';
 }
 
 function escapeRegExp(value) {
@@ -369,9 +401,12 @@ export async function grantScriptAccess(page, script, username, expiryDate, onSt
     throw new AutomationError(ErrorCodes.SELECTOR_NOT_FOUND, 'Username input not found in Manage Access.');
   }
 
+  await userInput.click({ timeout: 5000 });
   await userInput.fill('');
-  await userInput.fill(username);
-  await sleep(400);
+  // Type so TradingView search listeners fire (fill-only often skips results).
+  await userInput.pressSequentially(username, { delay: 40 });
+  await userInput.press('Enter').catch(() => {});
+  await sleep(700);
 
   const resolution = await resolveUsernameSearch(dialog, username);
   if (resolution === 'loading_timeout') {

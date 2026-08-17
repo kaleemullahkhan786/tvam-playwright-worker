@@ -199,24 +199,52 @@ async function usernameSuggestionVisible(dialog, username) {
   return false;
 }
 
-async function resolveUsernameSearch(dialog, username) {
-  const deadline = Date.now() + 15000;
-  let sawExplicitNoResults = false;
+async function findUsernameInput(dialog) {
+  const candidates = [
+    dialog.getByRole('textbox', { name: /user|username|search|add/i }),
+    dialog.locator('input[type="search"]'),
+    dialog.locator('input[placeholder*="user" i]'),
+    dialog.locator('input[placeholder*="search" i]'),
+    dialog.locator('input[placeholder*="name" i]'),
+    dialog.locator('input:not([type="hidden"]):not([type="date"]):not([type="checkbox"]):not([type="radio"])'),
+  ];
 
-  while (Date.now() < deadline) {
-    await waitForSearchSettled(dialog, 4000);
-
-    const networkHint = dialog
-      .getByText(/network|offline|connection|try again|something went wrong/i)
-      .first();
-    if (await networkHint.isVisible().catch(() => false)) {
-      throw new AutomationError(
-        ErrorCodes.NETWORK_ERROR,
-        'TradingView search reported a network/connection problem.'
-      );
+  for (const locator of candidates) {
+    const first = locator.first();
+    if (await first.isVisible({ timeout: 1500 }).catch(() => false)) {
+      return first;
     }
+  }
+  return null;
+}
 
+/**
+ * Type username and try to select the matching suggestion.
+ */
+async function searchAndSelectUsername(dialog, page, username) {
+  const userInput = await findUsernameInput(dialog);
+  if (!userInput) {
+    await screenshotOnFailure(page, 'username-input');
+    throw new AutomationError(ErrorCodes.SELECTOR_NOT_FOUND, 'Username input not found in Manage Access.');
+  }
+
+  await userInput.click({ timeout: 5000 });
+  await userInput.fill('');
+  await sleep(200);
+  // Character typing triggers TradingView autocomplete; avoid Enter (often submits too early).
+  await userInput.pressSequentially(username, { delay: 60 });
+  await sleep(1000);
+
+  const deadline = Date.now() + 25000;
+  while (Date.now() < deadline) {
     if (await usernameSuggestionVisible(dialog, username)) {
+      const suggestion = dialog.getByText(username, { exact: true }).first();
+      await suggestion.click({ timeout: 5000 }).catch(async () => {
+        await userInput.press('ArrowDown').catch(() => {});
+        await sleep(200);
+        await userInput.press('Enter').catch(() => {});
+      });
+      await sleep(500);
       return 'exists';
     }
 
@@ -224,20 +252,34 @@ async function resolveUsernameSearch(dialog, username) {
       .getByText(/no results|not found|couldn.?t find|no users found|nothing found|user does not exist/i)
       .first();
     if (await noResults.isVisible().catch(() => false)) {
-      sawExplicitNoResults = true;
-      // Keep polling briefly — TV sometimes flashes empty state before results.
-      await sleep(500);
+      // Brief flash of empty state is common — keep waiting a bit.
+      await sleep(600);
+      if (Date.now() > deadline - 3000 && !(await usernameSuggestionVisible(dialog, username))) {
+        return 'not_found';
+      }
       continue;
+    }
+
+    // Try keyboard select of first suggestion even if exact text match is delayed.
+    await userInput.press('ArrowDown').catch(() => {});
+    await sleep(250);
+    if (await usernameSuggestionVisible(dialog, username)) {
+      await userInput.press('Enter').catch(() => {});
+      await sleep(400);
+      return 'exists';
     }
 
     await sleep(400);
   }
 
-  if (await usernameSuggestionVisible(dialog, username)) {
-    return 'exists';
+  try {
+    const snippet = ((await dialog.innerText()) || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    logger.warn('Username search timed out; dialog snippet', { snippet, username });
+  } catch {
+    /* ignore */
   }
-
-  return sawExplicitNoResults ? 'not_found' : 'loading_timeout';
+  await screenshotOnFailure(page, 'username-search-timeout');
+  return 'loading_timeout';
 }
 
 function escapeRegExp(value) {
@@ -385,34 +427,14 @@ export async function grantScriptAccess(page, script, username, expiryDate, onSt
   }
 
   await openAddUsers(dialog);
-  await sleep(500);
+  await sleep(800);
   await step(`Searching for username "${username}"…`);
 
-  const userInput = dialog
-    .getByRole('textbox', { name: /user|username|search/i })
-    .or(dialog.locator('input[type="search"]'))
-    .or(dialog.locator('input[placeholder*="user" i]'))
-    .first();
-
-  try {
-    await userInput.waitFor({ state: 'visible', timeout: 15000 });
-  } catch {
-    await screenshotOnFailure(page, 'username-input');
-    throw new AutomationError(ErrorCodes.SELECTOR_NOT_FOUND, 'Username input not found in Manage Access.');
-  }
-
-  await userInput.click({ timeout: 5000 });
-  await userInput.fill('');
-  // Type so TradingView search listeners fire (fill-only often skips results).
-  await userInput.pressSequentially(username, { delay: 40 });
-  await userInput.press('Enter').catch(() => {});
-  await sleep(700);
-
-  const resolution = await resolveUsernameSearch(dialog, username);
+  const resolution = await searchAndSelectUsername(dialog, page, username);
   if (resolution === 'loading_timeout') {
     throw new AutomationError(
       ErrorCodes.USERNAME_LOADING_TIMEOUT,
-      `Username search still loading for "${username}".`
+      `Username search timed out for "${username}". TradingView did not return a selectable user (check username spelling, or TV may be blocking datacenter search).`
     );
   }
   if (resolution === 'not_found') {
@@ -420,11 +442,6 @@ export async function grantScriptAccess(page, script, username, expiryDate, onSt
   }
 
   await step('Username found — selecting…');
-  const suggestion = dialog.getByText(username, { exact: true }).first();
-  if (await suggestion.isVisible().catch(() => false)) {
-    await suggestion.click();
-    await sleep(400);
-  }
 
   const expiry = normalizeExpiry(expiryDate);
   if (expiry) {
